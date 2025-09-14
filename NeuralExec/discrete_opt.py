@@ -75,33 +75,63 @@ class WhiteBoxTokensOpt:
         
     
     def get_gradient(self, ne, prompts):    
+        # Clear any existing gradients
+        if hasattr(self.llm, 'zero_grad'):
+            self.llm.zero_grad()
+        torch.cuda.empty_cache()
+        
         # parse input
         prompts_tok, labels_tok, adv_mask = self.make_model_input(prompts, ne, keep_placeholder_tokens=True)
         batch_size = prompts_tok.input_ids.size(0)
 
-        prompt_emb = self.llm.model.embed_tokens(prompts_tok.input_ids)
+        # Use context manager to ensure cleanup
+        with torch.cuda.device(self.llm.device):
+            prompt_emb = self.llm.model.embed_tokens(prompts_tok.input_ids)
 
-        # make onehot
-        adv_ohe = torch.nn.functional.one_hot(ne.tokens, self.emb_matrix.shape[0]).float().to(self.emb_matrix.dtype).to(self.emb_matrix.device)
-        adv_ohe = adv_ohe.repeat((batch_size, 1, 1))
-        adv_ohe.requires_grad_()
-        # get embeddings adv_seg
-        adv_emb = (adv_ohe @ self.emb_matrix)
-                
-        #replace adv_seg placeholders in model's input
-        prompt_emb[adv_mask] = adv_emb.reshape((-1, adv_emb.size(-1)))
-        ###################################################################################
+            # Create one-hot more efficiently - avoid large tensor replication
+            vocab_size = self.emb_matrix.shape[0]
+            adv_ohe = torch.zeros(ne.tokens.size(0), vocab_size, device=self.emb_matrix.device, dtype=self.emb_matrix.dtype)
+            # Ensure ne.tokens is on the same device as adv_ohe for scatter_ operation
+            tokens_gpu = ne.tokens.to(self.emb_matrix.device)
+            adv_ohe.scatter_(1, tokens_gpu.unsqueeze(1), 1.0)
+            
+            # Replicate for batch only when needed
+            if batch_size > 1:
+                adv_ohe = adv_ohe.unsqueeze(0).repeat(batch_size, 1, 1)
+            else:
+                adv_ohe = adv_ohe.unsqueeze(0)
+            adv_ohe.requires_grad_()
+            
+            # get embeddings adv_seg
+            adv_emb = torch.matmul(adv_ohe, self.emb_matrix)
+                    
+            #replace adv_seg placeholders in model's input
+            prompt_emb[adv_mask] = adv_emb.reshape((-1, adv_emb.size(-1)))
+            
+            # Clear intermediate variables immediately
+            del adv_emb
+            
+            logits = self.llm(inputs_embeds=prompt_emb, attention_mask=prompts_tok.attention_mask).logits
+            losses = self._compute_loss(logits, labels_tok)
+            loss = losses.mean()
+            loss.backward()
+            
+            grad = adv_ohe.grad.detach().clone()
+            
+            # Store loss before cleanup
+            loss_value = loss.detach().cpu()
+            losses_value = losses.detach().cpu()
+            
+            # Clean up all tensors
+            del prompt_emb, logits, losses, loss, adv_ohe, prompts_tok, labels_tok
         
-        logits = self.llm(inputs_embeds=prompt_emb, attention_mask=prompts_tok.attention_mask).logits
-        losses = self._compute_loss(logits, labels_tok)
-        loss = losses.mean()
-        loss.backward()
+        # Final cleanup
+        torch.cuda.empty_cache()
         
-        grad = adv_ohe.grad.detach()
         grad = grad.sum(0)
         grad = grad / grad.norm()
         
-        return grad, loss, losses
+        return grad, loss_value, losses_value
     
         
     
@@ -117,7 +147,7 @@ class WhiteBoxTokensOpt:
 
         if not keep_placeholder_tokens and not ne is None:
             # replace adv tokens
-            prompts_tok.input_ids[adv_mask] = ne.tokens.repeat((len(prompts), 1)).ravel()
+            prompts_tok.input_ids[adv_mask] = ne.tokens.to(prompts_tok.input_ids.device).repeat((len(prompts), 1)).ravel()
 
         # just to compute the label shift
         targets_str = [prompt.target[self.llm_obj.llm_name] for prompt in prompts]
@@ -139,7 +169,7 @@ class WhiteBoxTokensOpt:
 
         if not keep_placeholder_tokens:
             adv_toks = torch.concat([ne.tokens for ne in nes])
-            prompts_tok.input_ids[adv_mask] = adv_toks
+            prompts_tok.input_ids[adv_mask] = adv_toks.to(prompts_tok.input_ids.device)
     
         # just to compute the label shift
         targets_str = [prompt.target[self.llm_obj.llm_name] for i in range(len(nes))]
@@ -184,7 +214,9 @@ class WhiteBoxTokensOpt:
         grad[:, ~self.tokens_to_exclude_mask] = torch.inf
 
         top_indices = (-grad).topk(topk, dim=1).indices
-        original_control_toks = control_toks.repeat(batch_size, 1)
+        # Ensure control_toks is on same device as grad for scatter_ operation
+        control_toks_gpu = control_toks.to(grad.device)
+        original_control_toks = control_toks_gpu.repeat(batch_size, 1)
         pre = original_control_toks.clone()
 
         for _ in range(m):
@@ -239,23 +271,35 @@ class WhiteBoxTokensOpt:
 
     @torch.no_grad()
     def _eval_loss(self, prompt, nes, weighted=True):
-        batch_size = self.hparams['batch_size_eval']
-        losses = []
+        # Use micro-batching to avoid OOM when processing many candidates
+        micro_batch_size = self.hparams.get('eval_micro_batch_size', 5)
+        all_losses = []
 
-        num_batches = math.ceil(len(nes) / batch_size)
+        # Process candidates in micro-batches
+        for i in range(0, len(nes), micro_batch_size):
+            # Clear cache before each micro-batch
+            torch.cuda.empty_cache()
+            
+            # Get micro-batch of candidates
+            micro_batch = nes[i:i + micro_batch_size]
 
-        for i in range(num_batches):
-            start = batch_size * i
-            stop = batch_size * (i+1)
+            with torch.cuda.device(self.llm.device), torch.autocast(device_type='cuda', dtype=torch.float16):
+                prompts_tok, labels_tok, _ = self.make_model_input(prompt, nes=micro_batch)
+                logits = self.llm(**prompts_tok).logits
+                loss = self._compute_loss(logits, labels_tok, weighted=weighted)
 
-            prompts_tok, labels_tok, _ = self.make_model_input(prompt, nes=nes[start:stop])
-            logits = self.llm(**prompts_tok).logits
-            loss = self._compute_loss(logits, labels_tok, weighted=weighted)
+                # Move to CPU immediately
+                loss_cpu = loss.detach().cpu().numpy()
+                all_losses.append(loss_cpu)
+                
+                # Clean up GPU tensors
+                del prompts_tok, labels_tok, logits, loss
+            
+            # Clear cache after each micro-batch
+            torch.cuda.empty_cache()
 
-            loss = loss.detach().cpu().numpy()
-            losses.append(loss)
-
-        losses = np.concatenate(losses)
+        # Concatenate all micro-batch results
+        losses = np.concatenate(all_losses)
 
         return losses
     
@@ -272,6 +316,9 @@ class WhiteBoxTokensOpt:
         for prompt in tqdm.tqdm(prompts):
             _losses = self._eval_loss(prompt, nes)
             losses.append(_losses)
+            
+            # Clean up after each prompt evaluation
+            torch.cuda.empty_cache()
             
         losses = np.concatenate([loss[np.newaxis,:] for loss in losses])
         agg_losses = losses.mean(0)
@@ -291,15 +338,40 @@ class WhiteBoxTokensOpt:
 
     def get_gradient_accum(self, ne, prompts):
         
-        accum_grad, accum_loss, _losses = self.get_gradient(ne, [prompts[0]])
-        losses = [_losses.detach().cpu().numpy()]
-        for prompt in prompts[1:]:
-            _grad, _loss, _losses = self.get_gradient(ne, [prompt])
-            accum_grad += _grad
-            losses.append(_losses.detach().cpu().numpy())
+        # Initialize accumulation variables
+        accum_grad = None
+        accum_loss = 0.0
+        losses = []
         
+        for i, prompt in enumerate(prompts):
+            # Clear previous gradients and memory
+            if hasattr(self.llm, 'zero_grad'):
+                self.llm.zero_grad()
+            torch.cuda.empty_cache()
+            
+            _grad, _loss, _losses = self.get_gradient(ne, [prompt])
+            
+            # Move losses to CPU immediately to free GPU memory
+            _losses_cpu = _losses.detach().cpu().numpy()
+            losses.append(_losses_cpu)
+            
+            # Accumulate gradients
+            if accum_grad is None:
+                accum_grad = _grad.clone()
+            else:
+                accum_grad += _grad
+                
+            # Delete GPU tensors immediately
+            del _grad, _loss, _losses
+            
+            # Force garbage collection every few iterations
+            if i % 3 == 2:
+                torch.cuda.empty_cache()
+        
+        # Normalize accumulated gradient
         accum_grad /= len(prompts)
         
+        # Compute average loss from CPU arrays
         losses = np.concatenate(losses)
         accum_loss = losses.mean()       
             
@@ -308,21 +380,42 @@ class WhiteBoxTokensOpt:
     @torch.no_grad()
     def eval_loss(self, prompts, ne, weighted=True):
         
+        # Limit validation prompts to prevent OOM (can be configured)
+        max_eval_prompts = self.hparams.get('max_eval_prompts', 50)  # Reduce from 100 to 50
+        if len(prompts) > max_eval_prompts:
+            prompts = prompts[:max_eval_prompts]
+        
         batch_size = self.hparams['batch_size_eval']
         num_batches = math.ceil(len(prompts) / batch_size)
         
         _losses = []
         
         for i in tqdm.trange(num_batches):
+            # Aggressive memory cleanup before each batch
+            torch.cuda.empty_cache()
+            
             start = batch_size * i
             stop = batch_size * (i+1)
+            
+            # Process batch with memory context management
+            with torch.cuda.device(self.llm.device):
+                prompts_tok, labels_tok, _ = self.make_model_input(prompts[start:stop], ne)
+                
+                with torch.autocast(device_type='cuda', dtype=torch.float16):
+                    logits = self.llm(**prompts_tok).logits
+                    losses = self._compute_loss(logits, labels_tok, weighted=weighted)
 
-            prompts_tok, labels_tok, _ = self.make_model_input(prompts[start:stop], ne)
-            logits = self.llm(**prompts_tok).logits
-            losses = self._compute_loss(logits, labels_tok, weighted=weighted)
-
-            losses = losses.detach().cpu().numpy()
-            _losses.append(losses)
+                    # Move to CPU immediately
+                    losses_cpu = losses.detach().cpu().numpy()
+                    _losses.append(losses_cpu)
+                
+                # Clean up GPU tensors immediately
+                del prompts_tok, labels_tok, logits, losses
+                
+            # Force garbage collection and cache clear after each batch  
+            import gc
+            gc.collect()
+            torch.cuda.empty_cache()
 
         _losses = np.concatenate(_losses)
 
@@ -361,7 +454,7 @@ class WhiteBoxTokensOpt:
 
         # replace adv tokens
         print(prompts_tok.input_ids.device, adv_mask.device, ne.tokens.device)
-        prompts_tok.input_ids[adv_mask] = ne.tokens.repeat((len(prompts), 1)).ravel()
+        prompts_tok.input_ids[adv_mask] = ne.tokens.to(prompts_tok.input_ids.device).repeat((len(prompts), 1)).ravel()
 
         _prompts_str = self.tokenizer.batch_decode(prompts_tok.input_ids, skip_special_tokens=False)
 

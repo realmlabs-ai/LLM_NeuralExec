@@ -1,5 +1,6 @@
 import os, sys, importlib, argparse
 import random
+import torch
 
 from NeuralExec.llm import load_llm
 from NeuralExec.discrete_opt import WhiteBoxTokensOpt
@@ -49,6 +50,9 @@ if __name__ == '__main__':
     # set gpus
     os.environ['CUDA_VISIBLE_DEVICES'] = args.gpus
     
+    # set memory allocation configuration to reduce fragmentation
+    os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
+    
     # load conf file
     conf = importlib.import_module(args.conf_file)
     hparams = conf.hparams
@@ -72,6 +76,11 @@ if __name__ == '__main__':
     for i in range(hparams['number_of_rounds']):
         print(f'Start round {i+1}/{hparams["number_of_rounds"]}')
         
+        # Force garbage collection and memory cleanup at start of each round
+        import gc
+        gc.collect()
+        torch.cuda.empty_cache()
+        
         if i % hparams['eval_fq'] == 0:
             print("Starting evaluation...")
             eval_losses = wbo.eval_loss(validation_prompts, ne)
@@ -85,6 +94,9 @@ if __name__ == '__main__':
             
             write_pickle(log_path, logger)
             
+            # Clear memory after evaluation
+            del eval_losses
+            torch.cuda.empty_cache()
             
         # sample batch for gradient
         train_batch = sample_batch(training_prompts, hparams['gradient_batch_size'])
@@ -95,8 +107,18 @@ if __name__ == '__main__':
         
         # sample candidate solutions
         new_candidate_tok = wbo.sample_new_candidates(ne, gradient)
+        
+        # Clean up gradient immediately after use
+        del gradient
+        torch.cuda.empty_cache()
+        
         # filter out bad ones
         new_candidate_tok = wbo.filter_candidates(ne, new_candidate_tok)
+        
         # pick new solution
         ne, best_candidate_loss, _, _ = wbo.test_candidates(train_batch, new_candidate_tok)
+        
+        # Clean up after each round
+        del losses, new_candidate_tok
+        torch.cuda.empty_cache()
         

@@ -13,7 +13,11 @@ class CandidatePool:
     def get_best(self):
         if self.disable:
             print("Disabled")
-            return self.B[-1]
+            ne_cpu, loss = self.B[-1]
+            # Return a GPU copy while keeping original on CPU
+            ne_gpu = ne_cpu.__class__(ne_cpu.prefix.clone(), ne_cpu.postfix.clone(), ne_cpu.sep)
+            ne_gpu.to_gpu()
+            return ne_gpu, loss
         
         i = np.argmin([loss for (ne, loss) in self.B])
         # is last
@@ -28,10 +32,21 @@ class CandidatePool:
             self.patience = self.hparams['patience']
             self.reconfigure()
         
-        return self.B[i]
+        # Return a GPU copy while keeping original on CPU
+        ne_cpu, loss = self.B[i]
+        ne_gpu = ne_cpu.__class__(ne_cpu.prefix.clone(), ne_cpu.postfix.clone(), ne_cpu.sep)
+        ne_gpu.to_gpu()
+        return ne_gpu, loss
     
     def insert_candidate(self, ne, loss):
-        self.B.append((ne, loss))
+        # Store CPU version to prevent GPU memory accumulation
+        ne_cpu = ne.detach()  # Moves to CPU as per ex_triggers.py:54
+        self.B.append((ne_cpu, loss))
+        
+        # Limit candidate pool size to prevent excessive memory usage
+        max_pool_size = 20  # Keep only last 20 candidates
+        if len(self.B) > max_pool_size:
+            self.B = self.B[-max_pool_size:]
         
     def reconfigure(self):
                 
@@ -66,38 +81,48 @@ class Logger:
             loss = loss.detach().cpu().numpy()
             
         adv_seg = ne.decode(tokenizer)
-        ne = ne.detach()
+        ne_cpu = ne.detach()  # This moves to CPU as per ex_triggers.py:54
         
         print(f'Neural Exec:-----> {adv_seg[0]} [PAYLOAD] {adv_seg[1]}')
         
-        self.log_train.append({'loss':loss, 'NeuralExec':ne, 'NeuralExec_str':adv_seg})
+        self.log_train.append({'loss':loss, 'NeuralExec':ne_cpu, 'NeuralExec_str':adv_seg})
         
     def add_eval_log(self, ne, loss, tokenizer):
         if type(loss) is torch.Tensor:
             loss = loss.detach().cpu().numpy()
             
         adv_seg = ne.decode(tokenizer)
-        ne = ne.detach()
+        ne_cpu = ne.detach()  # This moves to CPU as per ex_triggers.py:54
                 
         print(f'\tEval loss: {loss.mean()}')
         print(f'\tNeural Exec:-----> {adv_seg[0]} [PAYLOAD] {adv_seg[1]}')
         
-        self.log_eval.append({'loss':loss, 'NeuralExec':ne, 'NeuralExec_str':adv_seg})
+        self.log_eval.append({'loss':loss, 'NeuralExec':ne_cpu, 'NeuralExec_str':adv_seg})
         
     def get_last_adv_tok(self, best=True):
         assert len(self.log_eval)
         if best:
-            loss_eval = np.concatenate([l['loss'][np.newaxis,:] for l in self.log_eval]).mean(-1)
+            # Handle both scalar and array loss formats for backward compatibility
+            loss_eval = []
+            for l in self.log_eval:
+                if hasattr(l['loss'], 'mean'):  # Array format
+                    loss_eval.append(l['loss'].mean())
+                else:  # Scalar format
+                    loss_eval.append(l['loss'])
+            loss_eval = np.array(loss_eval)
             best_idx = loss_eval.argmin()
             last_ne = self.log_eval[best_idx]['NeuralExec']
             loss = loss_eval[best_idx]
         else:
             last_ne = self.log_train[-1]['NeuralExec']
-            loss = self.log_train[-1]['loss'].mean()
+            loss_val = self.log_train[-1]['loss']
+            loss = loss_val.mean() if hasattr(loss_val, 'mean') else loss_val
            
-        last_ne.to_gpu()
+        # Create a fresh GPU copy instead of modifying the logged version
+        last_ne_gpu = last_ne.__class__(last_ne.prefix.clone(), last_ne.postfix.clone(), last_ne.sep)
+        last_ne_gpu.to_gpu()
         
-        return last_ne, loss
+        return last_ne_gpu, loss
     
     def get_ne_with_i(self, i):
         _i = i // self.confs[1]['eval_fq']

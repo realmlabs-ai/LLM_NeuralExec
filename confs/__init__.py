@@ -8,13 +8,19 @@ hparams = {
     # max number of candidate solution to test
     'new_candidate_pool_size' : 50,
     # size of the batch used to compute the gradient and test candidate
-    'gradient_batch_size' : 10,
+    'gradient_batch_size' : 2,
     
     # topk tokens to consider in substitution
     'topk_probability_new_candidate' : 250,
     
     # batch size when eval candidates
-    'batch_size_eval' : 10,
+    'batch_size_eval' : 1,
+    
+    # micro-batch size for candidate evaluation (memory optimization)
+    'eval_micro_batch_size' : 5,
+    
+    # maximum validation prompts to process (memory optimization)
+    'max_eval_prompts' : 50,
     
     # number of opt rounds
     'number_of_rounds' : 500,
